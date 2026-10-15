@@ -1,0 +1,67 @@
+name: A Share Stock Picker
+
+on:
+  workflow_dispatch:
+  schedule:
+    # UTC 07:30 = 新加坡/北京时间 15:30；GitHub 定时触发可能延迟
+    - cron: "30 7 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-picker
+  cancel-in-progress: false
+
+jobs:
+  run-screening:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run stock screening
+        run: python a_share_stock_picker.py
+
+      - name: Prepare GitHub Pages report
+        if: success()
+        run: |
+          mkdir -p docs
+          cp stock_picker_output/stock_candidates.html docs/index.html
+          cp stock_picker_output/stock_candidates.csv docs/stock_candidates.csv
+
+      - name: Publish latest report to repository
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html docs/stock_candidates.csv
+          if git diff --cached --quiet; then
+            echo "报告内容没有变化，无需提交。"
+          else
+            git commit -m "Update stock screening report"
+            git push
+          fi
+
+      - name: Upload reports and logs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-picker-results
+          path: stock_picker_output/
+          if-no-files-found: warn
+          retention-days: 30
