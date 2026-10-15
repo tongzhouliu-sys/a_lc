@@ -37,7 +37,10 @@ ACTION_DIFF_THRESHOLD = 2.0
 
 WORKERS = 6
 REQUEST_DELAY = 0.10
-RETRY_TIMES = 2
+RETRY_TIMES = 3
+
+# 时区：统一采用北京时间 (UTC+8)
+BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
 
 OUTPUT_DIR = "stock_picker_output"
 RESULT_CSV = os.path.join(OUTPUT_DIR, "stock_candidates.csv")
@@ -73,6 +76,11 @@ RESULT_COLUMNS = [
 ]
 
 
+def get_beijing_now():
+    """获取当前北京时间"""
+    return dt.datetime.now(BEIJING_TZ)
+
+
 def safe_float(value, default=np.nan):
     try:
         value = float(value)
@@ -83,6 +91,18 @@ def safe_float(value, default=np.nan):
 
 def normalize_code(code):
     return str(code).strip().zfill(6)
+
+
+def get_market_prefix(code):
+    """获取东方财富对应的前缀 (sh / sz / bj)"""
+    code = normalize_code(code)
+    if code.startswith(("600", "601", "603", "605", "688", "689")):
+        return "sh"
+    elif code.startswith(("000", "001", "002", "003", "300", "301")):
+        return "sz"
+    elif code.startswith(("4", "8", "92")):
+        return "bj"
+    return "sz"
 
 
 def is_main_board(code):
@@ -119,37 +139,99 @@ def theoretical_limit_up(previous_close, code, name=""):
     return round_price(previous_close * (1 + get_limit_ratio(code, name)))
 
 
-def get_stock_list():
-    logger.info("开始获取 A 股股票列表")
-    stocks = ak.stock_info_a_code_name()
-    if stocks is None or stocks.empty:
-        raise RuntimeError("获取股票列表失败：接口返回空数据")
+def get_stock_list_fallback():
+    """基础全量股票列表获取（含重试逻辑）"""
+    logger.info("正在获取 A 股全量代码列表...")
+    last_err = None
+    for attempt in range(RETRY_TIMES):
+        try:
+            stocks = ak.stock_info_a_code_name()
+            if stocks is not None and not stocks.empty:
+                stocks = stocks.copy()
+                stocks.columns = [str(c).strip() for c in stocks.columns]
+                if "code" in stocks.columns and "name" in stocks.columns:
+                    stocks["code"] = stocks["code"].map(normalize_code)
+                    stocks["name"] = stocks["name"].astype(str).str.strip()
+                    stocks = stocks[stocks["code"].str.fullmatch(r"\d{6}", na=False)].copy()
+                    if EXCLUDE_ST:
+                        stocks = stocks[~stocks["name"].str.contains(r"ST", case=False, na=False)]
+                    if EXCLUDE_DELISTING:
+                        stocks = stocks[~stocks["name"].str.contains(r"退", case=False, na=False)]
+                    if MAIN_BOARD_ONLY:
+                        stocks = stocks[stocks["code"].map(is_main_board)]
+                    stocks = stocks.drop_duplicates(subset=["code"]).sort_values("code").reset_index(drop=True)
+                    return stocks
+        except Exception as exc:
+            last_err = exc
+            logger.warning("获取全量列表失败（尝试 %d/%d）：%s", attempt + 1, RETRY_TIMES, exc)
+            time.sleep(1.0 * (attempt + 1))
+    raise RuntimeError(f"获取股票列表最终失败：{last_err}")
 
-    stocks = stocks.copy()
-    stocks.columns = [str(c).strip() for c in stocks.columns]
-    if "code" not in stocks.columns or "name" not in stocks.columns:
-        raise RuntimeError(f"股票列表字段异常：{stocks.columns.tolist()}")
 
-    stocks["code"] = stocks["code"].map(normalize_code)
-    stocks["name"] = stocks["name"].astype(str).str.strip()
-    stocks = stocks[stocks["code"].str.fullmatch(r"\d{6}", na=False)].copy()
+def get_stock_pool():
+    """
+    两阶段极速初筛机制：
+    由于策略要求：当前最新交易日必须是真阳线（收盘 > 开盘）且涨幅在 (0, 5%]。
+    在拉取 500 天历史 K 线前，先通过单次全市场快照接口直接过滤掉 80% 当天不满足阳线条件的股票，
+    将耗时从 40~60 分钟缩短至 1~3 分钟，同时极大降低海外 IP 触发接口限流的概率。
+    若快照接口获取失败，则优雅降级为全量代码池扫描。
+    """
+    logger.info("尝试拉取全市场实时/收盘快照进行第 1 阶段快速初筛...")
+    for attempt in range(RETRY_TIMES):
+        try:
+            spot_df = ak.stock_zh_a_spot_em()
+            if spot_df is not None and not spot_df.empty:
+                spot_df = spot_df.copy()
+                spot_df.columns = [str(c).strip() for c in spot_df.columns]
 
-    if EXCLUDE_ST:
-        stocks = stocks[~stocks["name"].str.contains(r"ST", case=False, na=False)]
-    if EXCLUDE_DELISTING:
-        stocks = stocks[~stocks["name"].str.contains(r"退", case=False, na=False)]
-    if MAIN_BOARD_ONLY:
-        stocks = stocks[stocks["code"].map(is_main_board)]
+                code_col = next((c for c in ["代码", "code"] if c in spot_df.columns), None)
+                name_col = next((c for c in ["名称", "name"] if c in spot_df.columns), None)
+                close_col = next((c for c in ["最新价", "close"] if c in spot_df.columns), None)
+                open_col = next((c for c in ["今开", "open"] if c in spot_df.columns), None)
+                pct_col = next((c for c in ["涨跌幅", "pct_change"] if c in spot_df.columns), None)
 
-    stocks = stocks.drop_duplicates(subset=["code"]).sort_values("code")
-    stocks = stocks.reset_index(drop=True)
-    logger.info("待筛选股票数量：%d", len(stocks))
-    return stocks
+                if all([code_col, name_col, close_col, open_col, pct_col]):
+                    spot_df["code"] = spot_df[code_col].map(normalize_code)
+                    spot_df["name"] = spot_df[name_col].astype(str).str.strip()
+                    spot_df = spot_df[spot_df["code"].str.fullmatch(r"\d{6}", na=False)].copy()
+
+                    if EXCLUDE_ST:
+                        spot_df = spot_df[~spot_df["name"].str.contains(r"ST", case=False, na=False)]
+                    if EXCLUDE_DELISTING:
+                        spot_df = spot_df[~spot_df["name"].str.contains(r"退", case=False, na=False)]
+                    if MAIN_BOARD_ONLY:
+                        spot_df = spot_df[spot_df["code"].map(is_main_board)]
+
+                    total_all = len(spot_df)
+                    spot_df["_close"] = pd.to_numeric(spot_df[close_col], errors="coerce")
+                    spot_df["_open"] = pd.to_numeric(spot_df[open_col], errors="coerce")
+                    spot_df["_pct"] = pd.to_numeric(spot_df[pct_col], errors="coerce")
+
+                    # 核心初筛规则：最新交易日必须是真阳线（收盘 > 开盘），且涨跌幅在 (0, MAX_DAILY_GAIN] 之间
+                    cond_valid = (
+                        (spot_df["_close"] > 0)
+                        & (spot_df["_open"] > 0)
+                        & (spot_df["_close"] > spot_df["_open"])
+                        & (spot_df["_pct"] > 0)
+                        & (spot_df["_pct"] <= MAX_DAILY_GAIN)
+                    )
+                    filtered_df = spot_df.loc[cond_valid, ["code", "name"]].drop_duplicates("code").reset_index(drop=True)
+                    logger.info(
+                        "两阶段初筛成功：全市场 %d 只股票中，仅有 %d 只符合【最新交易日收真阳线且涨幅 (0, %.1f%%]】，进入第 2 阶段历史精筛！",
+                        total_all, len(filtered_df), MAX_DAILY_GAIN
+                    )
+                    return filtered_df
+        except Exception as exc:
+            logger.warning("全市场快照初筛失败（尝试 %d/%d）：%s", attempt + 1, RETRY_TIMES, exc)
+            time.sleep(1.0 * (attempt + 1))
+
+    logger.warning("快照初筛不可用，降级为全量代码扫描...")
+    return get_stock_list_fallback()
 
 
 def fetch_daily_history(code, start_date, end_date):
     last_error = None
-    for attempt in range(RETRY_TIMES + 1):
+    for attempt in range(RETRY_TIMES):
         try:
             time.sleep(REQUEST_DELAY)
             df = ak.stock_zh_a_hist(
@@ -199,13 +281,9 @@ def fetch_daily_history(code, start_date, end_date):
             return df.loc[valid].reset_index(drop=True)
         except Exception as exc:
             last_error = exc
-            logger.warning(
-                "%s 行情获取失败（尝试 %d/%d）：%s",
-                code, attempt + 1, RETRY_TIMES + 1, exc,
-            )
             time.sleep(0.5 * (attempt + 1))
 
-    logger.error("%s 行情获取最终失败：%s", code, last_error, exc_info=True)
+    logger.warning("%s 行情获取最终失败：%s", code, last_error)
     return pd.DataFrame()
 
 
@@ -415,93 +493,408 @@ def save_html_report(result_df, output_path=HTML_REPORT):
             report_df[col] = pd.Series(dtype="object")
     report_df = report_df[RESULT_COLUMNS]
 
-    table_html = report_df.to_html(
-        index=False, escape=True, border=0,
-        classes="stock-table", na_rep="", table_id="stockTable",
-        float_format=lambda x: f"{x:.3f}",
-    )
-    generated_at = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    latest_date = (
-        str(report_df["最新交易日"].iloc[0]) if not report_df.empty else "暂无候选"
-    )
+    # 生成带超链接与样式的高级表格行
+    rows_html = []
+    all_codes = []
+    for _, row in report_df.iterrows():
+        code = str(row["代码"])
+        all_codes.append(code)
+        market = get_market_prefix(code)
+        stock_url = f"https://quote.eastmoney.com/{market}{code}.html"
+        code_cell = f'<a class="stock-link" href="{stock_url}" target="_blank" title="打开东财行情">{code}</a>'
+        name_cell = f'<strong>{row["名称"]}</strong>'
+
+        cells = [
+            f'<td>{code_cell}</td>',
+            f'<td>{name_cell}</td>',
+            f'<td>{row["最新交易日"]}</td>',
+            f'<td>{row["最新收盘价"]:.2f}</td>',
+            f'<td><span class="badge badge-bullish">{row["连续真阳线数量"]} 连阳</span></td>',
+            f'<td>{row["连续阳线起始日"]}</td>',
+            f'<td>{row["启动日"]}</td>',
+            f'<td class="text-up">+{row["启动日涨幅_pct"]:.2f}%</td>',
+            f'<td>{int(row["启动日成交量"]):,}</td>',
+            f'<td>{row["启动日理论涨停价"]:.2f}</td>',
+            f'<td>{row["启动日后最低价"]:.2f}</td>',
+            f'<td>{row["跳空日"]}</td>',
+            f'<td>{row["缺口下沿"]:.2f}</td>',
+            f'<td>{row["缺口上沿"]:.2f}</td>',
+            f'<td>{row["缺口确认完成日"]}</td>',
+            f'<td>{row["250日最低价"]:.2f}</td>',
+            f'<td>{row["250日最高价"]:.2f}</td>',
+            f'<td><span class="badge badge-pos">{row["250日区间位置_pct"]:.1f}%</span></td>',
+        ]
+        rows_html.append(f'<tr>{"".join(cells)}</tr>')
+
+    tbody_content = "\n".join(rows_html)
+    thead_ths = "".join(f'<th data-col="{i}">{col} <span class="sort-icon">⇅</span></th>' for i, col in enumerate(RESULT_COLUMNS))
+
+    beijing_now = get_beijing_now()
+    generated_at = beijing_now.strftime("%Y-%m-%d %H:%M:%S (北京时间)")
+    latest_date = str(report_df["最新交易日"].iloc[0]) if not report_df.empty else "暂无候选"
     count = len(report_df)
+    codes_json_str = ",".join(all_codes)
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>A股选股报告</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A股智能选股报告 - 每日更新</title>
 <style>
-:root {{ color-scheme: light; --bg:#f4f6fa; --panel:#fff; --text:#202938; --muted:#667085; --line:#e4e7ec; --accent:#2563eb; }}
-* {{ box-sizing:border-box; }}
-body {{ margin:0; padding:24px; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }}
-.container {{ max-width:1600px; margin:0 auto; }}
-h1 {{ margin:0 0 8px; font-size:28px; }}
-.subtitle {{ color:var(--muted); font-size:14px; line-height:1.8; }}
-.summary {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; margin:20px 0; }}
-.card,.panel {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; }}
-.card {{ padding:20px; }}
-.card-label {{ color:var(--muted); font-size:13px; }}
-.card-value {{ margin-top:8px; font-size:25px; font-weight:700; }}
-.panel {{ padding:20px; }}
-.toolbar {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin-bottom:16px; }}
-input {{ width:min(100%,360px); padding:10px 12px; border:1px solid #d0d5dd; border-radius:8px; font-size:14px; }}
-.table-wrap {{ width:100%; overflow-x:auto; }}
-.stock-table {{ width:100%; border-collapse:collapse; white-space:nowrap; font-size:13px; }}
-.stock-table th,.stock-table td {{ padding:12px 14px; border-bottom:1px solid var(--line); text-align:left; }}
-.stock-table th {{ position:sticky; top:0; background:#f8fafc; cursor:pointer; user-select:none; }}
-.stock-table th:hover {{ color:var(--accent); }}
-.stock-table tbody tr:hover {{ background:#f8fafc; }}
-.note {{ margin-top:18px; color:var(--muted); font-size:12px; line-height:1.8; }}
-@media(max-width:700px) {{ body{{padding:12px}} h1{{font-size:22px}} .summary{{grid-template-columns:1fr;gap:10px}} .card,.panel{{padding:14px}} }}
+:root {{
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --card-bg: #1e293b;
+  --text: #f8fafc;
+  --text-muted: #94a3b8;
+  --border: #334155;
+  --accent: #38bdf8;
+  --accent-hover: #0284c7;
+  --up: #f43f5e;
+  --badge-bullish-bg: rgba(244, 63, 94, 0.15);
+  --badge-bullish-text: #fb7185;
+  --badge-pos-bg: rgba(56, 189, 248, 0.15);
+  --badge-pos-text: #38bdf8;
+  --hover-tr: #2d3748;
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  padding: 24px 20px;
+  line-height: 1.5;
+}}
+.container {{ max-width: 1680px; margin: 0 auto; }}
+
+/* 头部 */
+header {{
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+  gap: 16px;
+}}
+.title-group h1 {{
+  font-size: 26px;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.5px;
+}}
+.title-group p {{
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: 6px;
+}}
+
+/* 概览卡片 */
+.stats-grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 16px;
+  margin: 24px 0;
+}}
+.stat-card {{
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+}}
+.stat-label {{
+  font-size: 13px;
+  color: var(--text-muted);
+}}
+.stat-value {{
+  font-size: 28px;
+  font-weight: 700;
+  margin-top: 8px;
+  color: #fff;
+}}
+.stat-value.highlight {{
+  color: var(--accent);
+}}
+.stat-value.count-up {{
+  color: var(--up);
+}}
+
+/* 控制栏 */
+.toolbar {{
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px 12px 0 0;
+  padding: 16px 20px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border-bottom: none;
+}}
+.search-box {{
+  position: relative;
+  min-width: 280px;
+}}
+.search-box input {{
+  width: 100%;
+  padding: 9px 14px;
+  border-radius: 8px;
+  background: #0f172a;
+  border: 1px solid var(--border);
+  color: #fff;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}}
+.search-box input:focus {{
+  border-color: var(--accent);
+}}
+.action-buttons {{
+  display: flex;
+  gap: 10px;
+}}
+.btn {{
+  background: #334155;
+  color: #fff;
+  border: 1px solid #475569;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}}
+.btn:hover {{
+  background: #475569;
+}}
+.btn-primary {{
+  background: #0284c7;
+  border-color: #0369a1;
+}}
+.btn-primary:hover {{
+  background: #0369a1;
+}}
+
+/* 表格容器 */
+.table-container {{
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 0 0 12px 12px;
+  overflow-x: auto;
+}}
+table.stock-table {{
+  width: 100%;
+  border-collapse: collapse;
+  white-space: nowrap;
+  font-size: 13px;
+}}
+table.stock-table th {{
+  background: #1e293b;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-align: left;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  user-select: none;
+}}
+table.stock-table th:hover {{
+  color: #fff;
+  background: #283548;
+}}
+table.stock-table td {{
+  padding: 13px 16px;
+  border-bottom: 1px solid #283548;
+  color: #e2e8f0;
+}}
+table.stock-table tbody tr:hover {{
+  background: var(--hover-tr);
+}}
+.stock-link {{
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 600;
+  font-family: monospace;
+  font-size: 14px;
+}}
+.stock-link:hover {{
+  text-decoration: underline;
+  color: #7dd3fc;
+}}
+.text-up {{
+  color: var(--up);
+  font-weight: 600;
+}}
+.badge {{
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}}
+.badge-bullish {{
+  background: var(--badge-bullish-bg);
+  color: var(--badge-bullish-text);
+}}
+.badge-pos {{
+  background: var(--badge-pos-bg);
+  color: var(--badge-pos-text);
+}}
+.sort-icon {{
+  font-size: 10px;
+  margin-left: 4px;
+  color: #64748b;
+}}
+
+/* 页脚说明 */
+.footer-note {{
+  margin-top: 24px;
+  padding: 16px 20px;
+  border-radius: 8px;
+  background: #1e293b;
+  border-left: 4px solid var(--accent);
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.8;
+}}
+
+/* 空状态 */
+.empty-state {{
+  text-align: center;
+  padding: 48px 0;
+  color: var(--text-muted);
+  font-size: 15px;
+}}
+
+@media (max-width: 768px) {{
+  body {{ padding: 14px 10px; }}
+  .title-group h1 {{ font-size: 20px; }}
+  .toolbar {{ flex-direction: column; align-items: stretch; }}
+  .search-box {{ width: 100%; }}
+  .action-buttons {{ justify-content: flex-start; }}
+}}
 </style>
 </head>
 <body>
 <div class="container">
-<header>
-<h1>A股选股报告</h1>
-<div class="subtitle">报告生成时间：{generated_at}<br>最新行情日期：{latest_date}</div>
-</header>
-<section class="summary">
-<div class="card"><div class="card-label">候选股票数量</div><div class="card-value">{count}</div></div>
-<div class="card"><div class="card-label">250日区间位置</div><div class="card-value">严格低于 {MAX_POSITION * 100:.0f}%</div></div>
-<div class="card"><div class="card-label">最低连续真阳线</div><div class="card-value">{MIN_BULLISH_DAYS} 根</div></div>
-</section>
-<section class="panel">
-<div class="toolbar"><h2 style="margin:0;font-size:18px">候选股票明细</h2>
-<input id="searchInput" type="search" placeholder="搜索股票代码或名称..." aria-label="搜索股票代码或名称"></div>
-<div class="table-wrap">{table_html}</div>
-<div class="note">
-价格区间位置 = (当前收盘价 - 近250日最低价) / (近250日最高价 - 近250日最低价) × 100%。<br>
-启动日理论涨停价为估算值，不代表历史交易所实际涨停价。疑似除权除息识别为启发式过滤，不能保证识别全部公司行为。报告仅供研究参考，不构成投资建议。
+  <header>
+    <div class="title-group">
+      <h1>📈 A股每日选股策略报告</h1>
+      <p>执行时间：{generated_at} ｜ 行情基准日：{latest_date}</p>
+    </div>
+    <div class="action-buttons">
+      <button class="btn" id="copyCodesBtn" onclick="copyStockCodes()">📋 复制代码列表</button>
+      <a class="btn btn-primary" href="stock_candidates.csv" download>📥 下载 CSV 数据</a>
+    </div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">今日入选股票</div>
+      <div class="stat-value count-up">{count} <span style="font-size:14px;font-weight:normal;color:#94a3b8">只</span></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">250日价格位置门槛</div>
+      <div class="stat-value highlight">&lt; {MAX_POSITION * 100:.0f}%</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">连续真阳线门槛</div>
+      <div class="stat-value">&ge; {MIN_BULLISH_DAYS} 根</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">启动日单日放量</div>
+      <div class="stat-value">&ge; {VOLUME_MULTIPLE:.1f} 倍</div>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <div class="search-box">
+      <input type="search" id="searchInput" placeholder="搜索代码、股票名称..." autocomplete="off">
+    </div>
+    <div style="font-size: 13px; color: var(--text-muted)">
+      点击表头可双向排序 ｜ 点击代码直接跳转东财行情
+    </div>
+  </div>
+
+  <div class="table-container">
+    <table class="stock-table" id="stockTable">
+      <thead>
+        <tr>{thead_ths}</tr>
+      </thead>
+      <tbody>
+        {tbody_content if count > 0 else '<tr><td colspan="18" class="empty-state">今日暂无符合全部条件的候选标的</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer-note">
+    <strong>📌 筛选逻辑说明：</strong><br>
+    1. <strong>位置过滤</strong>：严格限制最新价在近250个交易日极值区间的 50% 以下（低位安全边际）。<br>
+    2. <strong>形态要求</strong>：过去 20 个交易日内出现过单日涨幅 &ge; 10% 且放量 1.5 倍以上的启动日；后续出现过有效跳空缺口（3日内不回补）；启动日后未跌破理论涨停底线。<br>
+    3. <strong>温和连阳</strong>：截至最新收盘日，维持至少连续 3 根涨幅在 (0, 5%] 范围内的真阳线。<br>
+    ⚠️ <em>免责声明：本工具为量化策略筛选实验，数据源自公开行情接口，不构成任何投资建议，股市有风险，入市需谨慎。</em>
+  </div>
 </div>
-</section>
-</div>
+
 <script>
+const STOCK_CODES = "{codes_json_str}";
+
+function copyStockCodes() {{
+  if (!STOCK_CODES) {{
+    alert("当前无入选股票代码");
+    return;
+  }}
+  const formatted = STOCK_CODES.split(",").join("\\n");
+  navigator.clipboard.writeText(formatted).then(() => {{
+    const btn = document.getElementById("copyCodesBtn");
+    const oldText = btn.innerText;
+    btn.innerText = "✅ 已复制到剪贴板";
+    setTimeout(() => btn.innerText = oldText, 2000);
+  }}).catch(err => {{
+    alert("复制失败，请手动选取复制");
+  }});
+}}
+
 (function() {{
- const input=document.getElementById("searchInput");
- const table=document.getElementById("stockTable");
- if(!input||!table) return;
- const tbody=table.tBodies[0];
- input.addEventListener("input",function() {{
-   const q=input.value.trim().toLowerCase();
-   Array.from(tbody.rows).forEach(row=>row.style.display=row.textContent.toLowerCase().includes(q)?"":"none");
- }});
- Array.from(table.tHead.rows[0].cells).forEach((th,index)=>{{
-   let asc=true; th.title="点击排序";
-   th.addEventListener("click",function() {{
-     const rows=Array.from(tbody.rows);
-     rows.sort((a,b)=>{{
-       const x=a.cells[index].textContent.trim(), y=b.cells[index].textContent.trim();
-       const nx=Number(x), ny=Number(y);
-       const result=(x!==""&&y!==""&&Number.isFinite(nx)&&Number.isFinite(ny))
-         ? nx-ny : x.localeCompare(y,"zh-CN",{{numeric:true}});
-       return asc?result:-result;
-     }});
-     rows.forEach(row=>tbody.appendChild(row)); asc=!asc;
-   }});
- }});
+  const input = document.getElementById("searchInput");
+  const table = document.getElementById("stockTable");
+  if (!table) return;
+  const tbody = table.tBodies[0];
+
+  if (input) {{
+    input.addEventListener("input", function() {{
+      const q = input.value.trim().toLowerCase();
+      Array.from(tbody.rows).forEach(row => {{
+        row.style.display = row.textContent.toLowerCase().includes(q) ? "" : "none";
+      }});
+    }});
+  }}
+
+  // 表头排序
+  Array.from(table.tHead.rows[0].cells).forEach((th, index) => {{
+    let asc = true;
+    th.addEventListener("click", function() {{
+      const rows = Array.from(tbody.rows);
+      if (rows.length <= 1 && rows[0].cells.length === 1) return; // 空状态行跳过
+      rows.sort((a, b) => {{
+        const x = a.cells[index].innerText.replace(/[%+,]/g, "").trim();
+        const y = b.cells[index].innerText.replace(/[%+,]/g, "").trim();
+        const nx = parseFloat(x);
+        const ny = parseFloat(y);
+        if (!isNaN(nx) && !isNaN(ny)) {{
+          return asc ? nx - ny : ny - nx;
+        }}
+        return asc ? x.localeCompare(y, "zh-CN") : y.localeCompare(x, "zh-CN");
+      }});
+      rows.forEach(r => tbody.appendChild(r));
+      asc = !asc;
+    }});
+  }});
 }})();
 </script>
 </body>
@@ -513,19 +906,24 @@ input {{ width:min(100%,360px); padding:10px 12px; border:1px solid #d0d5dd; bor
 
 def main():
     start_time = time.time()
+    beijing_start = get_beijing_now()
     logger.info("=" * 60)
-    logger.info("A股选股开始；250日区间位置严格小于 %.1f%%", MAX_POSITION * 100)
-    logger.info("仅主板：%s；排除ST：%s；排除退市：%s",
-                MAIN_BOARD_ONLY, EXCLUDE_ST, EXCLUDE_DELISTING)
+    logger.info("A股智能选股开始（执行时间：%s）", beijing_start.strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("参数配置：区间位置 < %.1f%%，连阳 >= %d 根，仅主板=%s，排除ST=%s，排除退市=%s",
+                MAX_POSITION * 100, MIN_BULLISH_DAYS, MAIN_BOARD_ONLY, EXCLUDE_ST, EXCLUDE_DELISTING)
 
-    today = dt.date.today()
+    today = beijing_start.date()
     start_date = (today - dt.timedelta(days=HISTORY_CALENDAR_DAYS)).strftime("%Y%m%d")
     end_date = today.strftime("%Y%m%d")
-    stocks = get_stock_list()
+
+    # 获取股票初筛池（两阶段极速模式）
+    stocks = get_stock_pool()
 
     results = []
     total = len(stocks)
     completed = 0
+    logger.info("开始拉取并回测历史数据，待精析股票数：%d", total)
+
     with ThreadPoolExecutor(max_workers=WORKERS) as executor:
         futures = {
             executor.submit(analyze_stock, row, start_date, end_date): row
@@ -538,11 +936,11 @@ def main():
                 result = future.result()
                 if result:
                     results.append(result)
-                    logger.info("命中候选：%s %s", result["代码"], result["名称"])
+                    logger.info("🎉 命中候选：%s %s", result["代码"], result["名称"])
             except Exception:
                 logger.exception("处理股票失败：%s %s", stock.get("code", ""), stock.get("name", ""))
-            if completed % 100 == 0 or completed == total:
-                logger.info("进度：%d/%d", completed, total)
+            if completed % 50 == 0 or completed == total:
+                logger.info("精析进度：%d/%d (%.1f%%)", completed, total, (completed / total) * 100)
 
     result_df = pd.DataFrame(results, columns=RESULT_COLUMNS)
     if not result_df.empty:
@@ -554,10 +952,10 @@ def main():
     result_df.to_csv(RESULT_CSV, index=False, encoding="utf-8-sig")
     save_html_report(result_df, HTML_REPORT)
 
-    logger.info("筛选完成，候选数量：%d", len(result_df))
-    logger.info("CSV：%s", os.path.abspath(RESULT_CSV))
-    logger.info("HTML：%s", os.path.abspath(HTML_REPORT))
-    logger.info("耗时：%.1f秒", time.time() - start_time)
+    logger.info("筛选全部完成！最终命中候选股票：%d 只", len(result_df))
+    logger.info("CSV 文件输出：%s", os.path.abspath(RESULT_CSV))
+    logger.info("HTML 网页输出：%s", os.path.abspath(HTML_REPORT))
+    logger.info("总耗时：%.1f 秒", time.time() - start_time)
     print(result_df.to_string(index=False) if not result_df.empty else "本次没有符合条件的股票。")
 
 

@@ -3,11 +3,13 @@ name: A Share Stock Picker
 on:
   workflow_dispatch:
   schedule:
-    # UTC 07:30 = 新加坡/北京时间 15:30；GitHub 定时触发可能延迟
-    - cron: "30 7 * * 1-5"
+    # UTC 07:35 = 新加坡/北京时间 15:35（A股15:00收盘，避开整点拥堵）
+    - cron: "35 7 * * 1-5"
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
   group: stock-picker
@@ -16,7 +18,9 @@ concurrency:
 jobs:
   run-screening:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
+    env:
+      TZ: Asia/Shanghai
 
     steps:
       - name: Checkout repository
@@ -37,25 +41,37 @@ jobs:
       - name: Run stock screening
         run: python a_share_stock_picker.py
 
-      - name: Prepare GitHub Pages report
+      - name: Prepare Pages directory
         if: success()
         run: |
           mkdir -p docs
           cp stock_picker_output/stock_candidates.html docs/index.html
           cp stock_picker_output/stock_candidates.csv docs/stock_candidates.csv
 
-      - name: Publish latest report to repository
+      - name: Commit & push updated report to docs
         if: success()
+        continue-on-error: true
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/index.html docs/stock_candidates.csv
           if git diff --cached --quiet; then
-            echo "报告内容没有变化，无需提交。"
+            echo "报告内容无变化，无需提交。"
           else
-            git commit -m "Update stock screening report"
+            git commit -m "chore: 自动更新选股报告 [skip ci]"
             git push
           fi
+
+      - name: Upload Pages artifact
+        if: success()
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+      - name: Deploy to GitHub Pages
+        if: success()
+        id: deployment
+        uses: actions/deploy-pages@v4
 
       - name: Upload reports and logs as artifacts
         if: always()
